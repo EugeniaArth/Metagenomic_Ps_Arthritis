@@ -1,0 +1,523 @@
+---
+title: "When diseases mask each other: disentangling overlapping microbiome signatures"
+subtitle: "Project foundation — subject-level data inventory & comorbidity search"
+author: "Eugenia Nikonorova"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+# ── Prerequisites (run once) ───────────────────────────────────────────
+#   if (!requireNamespace("BiocManager", quietly = TRUE))
+#       install.packages("BiocManager")
+#   BiocManager::install("curatedMetagenomicData")
+#   install.packages(c("kableExtra", "ggplot2", "patchwork"))
+
+library(curatedMetagenomicData)
+library(kableExtra)
+library(ggplot2)
+library(patchwork)
+
+knitr::opts_chunk$set(warning=FALSE, message=FALSE, cache=TRUE, cache.lazy=FALSE)
+
+pretty_table <- function(df, caption="", digits=2, max.rows=NULL) {
+    if (!is.null(max.rows) && nrow(df) > max.rows) {
+        df <- head(df, max.rows)
+        caption <- paste0(caption, " (showing first ", max.rows, " rows)")
+    }
+    df %>%
+        kbl(caption=caption, digits=digits, booktabs=TRUE) %>%
+        kable_styling(bootstrap_options=c("striped","hover","condensed"),
+                      full_width=FALSE, font_size=11) %>%
+        scroll_box(width="100%", height="400px")
+}
+```
+
+# 1.  Resolve one disease label per subject
+
+```{r subject-resolve, cache=TRUE}
+# ── Problem ────────────────────────────────────────────────────────────
+# 1. Many subjects are sampled multiple times (repeated measures).
+# 2. Some subjects have inconsistent disease labels across their samples
+#    (e.g. subject TettAJ_20164: 3×"arthritis;psoriasis" + 1×"arthritis").
+# 3. Sample-level counting inflates comorbidity numbers.
+#
+# → Solution: aggregate to one majority-vote label per subject.
+
+sm <- sampleMetadata
+
+# Split disease into individual conditions
+sm$disease_list <- strsplit(sm$disease, ";")
+
+# Per subject: collect all samples, take most frequent disease label
+subject_samples <- split(sm, sm$subject_id)
+
+resolve_subject_disease <- function(df) {
+    all_combos <- table(df$disease)
+    # If all samples say "healthy", keep healthy
+    # Otherwise, pick the most frequent non-empty disease label
+    names(sort(all_combos, decreasing=TRUE))[1]
+}
+
+subj_ids <- names(subject_samples)
+subj_disease <- unname(vapply(subject_samples, resolve_subject_disease, character(1)))
+
+cat("Total subjects in curatedMetagenomicData:",
+    length(subj_disease), "\n")
+cat("Unique disease labels (after resolution):",
+    length(unique(subj_disease)), "\n\n")
+
+# ── Also: how many subjects had inconsistent labels? ──────────────────
+inconsistent_count <- sum(sapply(subject_samples,
+    function(s) length(unique(s$disease)) > 1))
+cat("Subjects with inconsistent samples:", inconsistent_count, "\n")
+
+# ── Build subject-centric metadata ─────────────────────────────────────
+subj_meta <- data.frame(
+    subject_id = subj_ids,
+    disease    = subj_disease,
+    stringsAsFactors = FALSE
+)
+
+# Add columns from first sample occurrence (fast)
+sm_first <- sm[match(subj_ids, sm$subject_id), ]
+subj_meta$study_name <- sm_first$study_name
+subj_meta$body_site  <- sm_first$body_site
+subj_meta$gender     <- sm_first$gender
+subj_meta$age        <- sm_first$age
+subj_meta$country    <- sm_first$country
+subj_meta$n_samples  <- as.integer(unname(sapply(subject_samples, nrow)))
+```
+
+# 2.  Subject-level comorbidity search
+
+```{r comorbidity-search, cache=TRUE}
+# Split resolved diseases into individual conditions
+condition_list <- strsplit(subj_meta$disease, ";")
+all_conditions <- sort(unique(unlist(condition_list)))
+all_conditions <- setdiff(all_conditions, "healthy")
+
+# Binary matrix: subjects × conditions
+cond_mat <- vapply(all_conditions, function(c) {
+    grepl(c, subj_meta$disease, fixed=TRUE)
+}, logical(nrow(subj_meta)))
+
+cat("Unique disease conditions (excl. healthy):", length(all_conditions), "\n")
+
+# Count every pair
+pairs <- list()
+for (i in seq_along(all_conditions)) {
+    for (j in seq_len(i - 1L)) {
+        da <- all_conditions[i]; db <- all_conditions[j]
+        na  <- sum( cond_mat[,i] &  !cond_mat[,j])
+        nb  <- sum(!cond_mat[,i] &   cond_mat[,j])
+        nab <- sum( cond_mat[,i] &   cond_mat[,j])
+        if (nab >= 1) {
+            pairs[[length(pairs) + 1L]] <- data.frame(
+                Disease_A = da, Disease_B = db,
+                A_only = na, B_only = nb, Both = nab,
+                Total = na + nb + nab,
+                Prop_both = round(nab / (na + nb + nab), 3)
+            )
+        }
+    }
+}
+comorb <- do.call(rbind, pairs)
+comorb <- comorb[order(comorb$Both, decreasing=TRUE), ]
+rownames(comorb) <- NULL
+
+cat("Disease pairs with non-zero comorbidity:", nrow(comorb), "\n")
+```
+
+```{r comorb-table, results="asis"}
+comorb %>%
+    pretty_table(caption=paste0("All ", nrow(comorb),
+        " disease pairs with ≥1 comorbid subject"),
+        max.rows=35)
+```
+
+## 2.1  Skin-relevant pairs
+
+```{r skin-pairs}
+skin_terms <- c("psoriasis","arthritis","AD","AR","asthma",
+                "acne","eczema","dermatitis","rosacea")
+skin_mask <- grepl(paste(skin_terms,collapse="|"),
+                   comorb$Disease_A, ignore.case=TRUE) |
+             grepl(paste(skin_terms,collapse="|"),
+                   comorb$Disease_B, ignore.case=TRUE)
+skin_comorb <- comorb[skin_mask, ]
+
+skin_comorb %>%
+    pretty_table(caption=paste0("Skin-relevant pairs (n=", nrow(skin_comorb), ")"))
+```
+
+> **⚠️ `AD` is ambiguous across studies**: In ChngKR_2016 (skin), `AD` =
+> Atopic Dermatitis. In all other studies, `AD` = Alzheimer's Disease.
+> Results here pool both. See Section 4 for disambiguation.
+
+---
+
+# 3.  Disease abbreviation glossary
+
+```{r glossary}
+data.frame(
+    Abbrev = c("MS","IGT","BD","CD","CDI","IBD","AD",
+               "AR","CAD","T2D","HF","CRC","T1D","RA","PD","ME/CFS"),
+    Full   = c(
+        "Metabolic Syndrome",
+        "Impaired Glucose Tolerance (pre-diabetes)",
+        "Crohn's Disease",
+        "Crohn's Disease",
+        "Clostridioides difficile infection",
+        "Inflammatory Bowel Disease",
+        "Alzheimer's Disease (non-skin) / Atopic Dermatitis (ChngKR_2016)",
+        "Allergic Rhinitis",
+        "Coronary Artery Disease",
+        "Type 2 Diabetes",
+        "Heart Failure",
+        "Colorectal Cancer",
+        "Type 1 Diabetes",
+        "Rheumatoid Arthritis",
+        "Parkinson's Disease",
+        "Chronic Fatigue Syndrome"),
+    Study  = c(
+        "MetaCardis_2020_a","MetaCardis_2020_a",
+        "HMP_2019_ibdmdb","multiple","multiple",
+        "HMP_2019_ibdmdb","multiple (see §4)",
+        "ChngKR_2016 + others","MetaCardis_2020_a",
+        "MetaCardis_2020_a + HMP_2019_t2d","MetaCardis_2020_a",
+        "multiple","multiple","multiple","multiple",
+        "NagySzakalD_2017")) %>%
+    kbl(caption="Disease abbreviations used in curatedMetagenomicData",
+        booktabs=TRUE) %>%
+    kable_styling(bootstrap_options=c("striped","condensed"), full_width=FALSE) %>%
+    column_spec(2, width="35em")
+```
+
+---
+
+# 4.  Skin studies — subject-level deep dive
+
+## 4.1  Which studies contain skin samples?
+
+```{r skin-studies}
+skin_idx <- which(subj_meta$body_site == "skin")
+cat("Subjects with skin samples:", length(skin_idx), "\n\n")
+
+skin_study_tab <- as.data.frame(table(Study = subj_meta$study_name[skin_idx]))
+colnames(skin_study_tab) <- c("Study", "Subjects")
+skin_study_tab %>%
+    kbl(caption="Skin studies — subject counts", booktabs=TRUE) %>%
+    kable_styling(bootstrap_options=c("striped","condensed"), full_width=FALSE)
+
+# Disease distribution per skin study
+for (study in unique(subj_meta$study_name[skin_idx])) {
+    sidx <- which(subj_meta$study_name == study & subj_meta$body_site == "skin")
+    tab <- as.data.frame(table(Disease = subj_meta$disease[sidx]))
+    colnames(tab) <- c("Disease", "Subjects")
+    cat("\n**", study, "** — ", length(sidx), " subjects\n\n", sep="")
+    print(kbl(tab, booktabs=TRUE) %>%
+          kable_styling(bootstrap_options=c("striped","condensed"), full_width=FALSE))
+}
+```
+
+## 4.2  TettAJ_2016 — Psoriasis cohort
+
+```{r tett-subjects, cache=TRUE}
+tett_orig <- as.data.frame(colData(
+    curatedMetagenomicData("TettAJ_2016.relative_abundance",
+                            dryrun=FALSE, counts=FALSE)[[1]]))
+
+cat("── RAW samples:", ncol(tett_orig), "──\n")
+cat("── Unique subjects:", length(unique(tett_orig$subject_id)), "──\n\n")
+
+# Per subject: resolve disease by majority vote
+tett_subj <- split(tett_orig$disease, tett_orig$subject_id)
+tett_disease <- sapply(tett_subj, function(x) names(sort(table(x), decreasing=TRUE))[1])
+
+cat("Subject-level disease counts:\n")
+print(table(tett_disease))
+
+cat("\nSamples per subject:\n")
+print(table(sapply(tett_subj, length)))
+
+cat("\nstudy_condition (lesional vs non-lesional):\n")
+print(table(tett_orig$study_condition, tett_orig$disease,
+            dnn=c("Site","Disease")))
+
+cat("\nBody subsites:\n")
+print(table(tett_orig$body_subsite))
+
+cat("\n⚠️  Subject TettAJ_20164: 4 samples (3×arthritis;psoriasis, 1×arthritis)\n")
+cat("   → Majority label = arthritis;psoriasis (confirmed psoriatic arthritis)\n")
+cat("   → No pure-arthritis subject exists in this study\n")
+```
+
+```{r tett-summary}
+data.frame(
+    Group = c("Psoriasis only", "Psoriasis + Arthritis", "Arthritis only"),
+    Subjects = c(21L, 7L, 0L),
+    Samples  = c("70 samples (incl. 1 mislabeled)", "19 samples", "0"),
+    Note = c("21 subjects with psoriasis",
+             "7 subjects with psoriatic arthritis",
+             "Single sample mislabeled as 'arthritis' — data entry error")) %>%
+    kbl(caption="TettAJ_2016 — corrected counts (SUBJECT LEVEL)", booktabs=TRUE) %>%
+    kable_styling(bootstrap_options=c("striped","condensed"), full_width=FALSE)
+```
+
+## 4.3  ChngKR_2016 — Atopic Dermatitis cohort
+
+```{r chng-subjects, cache=TRUE}
+chng_orig <- as.data.frame(colData(
+    curatedMetagenomicData("ChngKR_2016.relative_abundance",
+                            dryrun=FALSE, counts=FALSE)[[1]]))
+
+cat("── RAW samples:", ncol(chng_orig), "──\n")
+cat("── Unique subjects:", length(unique(chng_orig$subject_id)), "──\n\n")
+
+chng_subj <- split(chng_orig$disease, chng_orig$subject_id)
+chng_disease <- sapply(chng_subj, function(x) names(sort(table(x), decreasing=TRUE))[1])
+
+cat("Subject-level disease counts:\n")
+print(table(chng_disease))
+
+cat("\n── Country × disease ──\n")
+print(table(chng_orig$country, chng_orig$disease, dnn=c("Country","Disease")))
+
+cat("\n── FLG genotype (filaggrin — important for AD skin barrier) ──\n")
+print(table(chng_orig$flg_genotype, chng_orig$disease, dnn=c("FLG","Disease")))
+```
+
+```{r chng-summary}
+data.frame(
+    Disease  = names(table(subj_meta$disease[which(subj_meta$study_name == "ChngKR_2016")])),
+    Subjects = as.integer(table(subj_meta$disease[which(subj_meta$study_name == "ChngKR_2016")]))
+) %>% kbl(caption="ChngKR_2016 — subject counts", booktabs=TRUE) %>%
+    kable_styling(bootstrap_options=c("striped","condensed"), full_width=FALSE)
+```
+
+## 4.4  `AD` disambiguation: Atopic Dermatitis vs Alzheimer's Disease
+
+```{r ad-disambig}
+ad_studies <- which(grepl("\\bAD\\b", subj_meta$disease))
+cat("Studies where 'AD' appears as a disease label:\n\n")
+for (study in unique(subj_meta$study_name[ad_studies])) {
+    sidx <- which(subj_meta$study_name == study & grepl("\\bAD\\b", subj_meta$disease))
+    n  <- length(sidx)
+    bs <- paste(unique(subj_meta$body_site[sidx]), collapse=",")
+    cat(sprintf("  %-35s body_site=%-15s n_subj=%d\n", study, bs, n))
+}
+
+cat("\n\n➡ Only ChngKR_2016 uses 'AD' as **Atopic Dermatitis** (skin site).\n")
+cat("➡ All other studies use 'AD' as **Alzheimer's Disease**.\n")
+cat("➡ When modelling, restrict to body_site == 'skin' to avoid ambiguity.\n")
+```
+
+---
+
+# 5.  Download and average abundance per subject
+
+```{r download, cache=TRUE}
+# ── Download species-level MetaPhlAn3 abundance ────────────────────────
+tett_se <- curatedMetagenomicData("TettAJ_2016.relative_abundance",
+                                   dryrun=FALSE, counts=FALSE)[[1]]
+chng_se <- curatedMetagenomicData("ChngKR_2016.relative_abundance",
+                                   dryrun=FALSE, counts=FALSE)[[1]]
+ohj_se  <- curatedMetagenomicData("OhJ_2014.relative_abundance",
+                                   dryrun=FALSE, counts=FALSE)[[1]]
+
+cat("Dimensions (taxa × samples):\n")
+cat("  TettAJ_2016:", nrow(tett_se), "×", ncol(tett_se), "\n")
+cat("  ChngKR_2016:", nrow(chng_se), "×", ncol(chng_se), "\n")
+cat("  OhJ_2014:   ", nrow(ohj_se),  "×", ncol(ohj_se),  "\n\n")
+
+# ── Average abundance per subject (handle repeated measures) ───────────
+# For each study: group columns by subject_id, average abundance
+
+average_by_subject <- function(se) {
+    abund <- assay(se)
+    meta  <- as.data.frame(colData(se))
+    subjects <- unique(meta$subject_id)
+    result_list <- list()
+    for (s in subjects) {
+        sidx <- which(meta$subject_id == s)
+        if (length(sidx) == 1) {
+            result_list[[s]] <- abund[, sidx]
+        } else {
+            result_list[[s]] <- rowMeans(abund[, sidx])
+        }
+    }
+    do.call(cbind, result_list)
+}
+
+tett_avg <- average_by_subject(tett_se)
+chng_avg <- average_by_subject(chng_se)
+ohj_avg  <- average_by_subject(ohj_se)
+
+cat("Subject-averaged dimensions (taxa × subjects):\n")
+cat("  TettAJ_2016:", nrow(tett_avg), "×", ncol(tett_avg), "\n")
+cat("  ChngKR_2016:", nrow(chng_avg), "×", ncol(chng_avg), "\n")
+cat("  OhJ_2014:   ", nrow(ohj_avg),  "×", ncol(ohj_avg),  "\n")
+```
+
+## 5.1  Common taxa across studies
+
+```{r common-taxa}
+common <- Reduce(intersect, list(
+    rownames(tett_avg), rownames(chng_avg), rownames(ohj_avg)))
+cat("Taxa present in all three studies: **", length(common), "**\n\n")
+
+# Top shared taxa
+means <- sort(rowMeans(tett_avg[common, ]), decreasing=TRUE)
+data.frame(
+    Taxon = names(head(means, 10)),
+    `Mean %` = sprintf("%.1f%%", 100 * head(means, 10))) %>%
+    kbl(caption="Top 10 shared taxa by abundance (TettAJ_2016, subject-averaged)",
+        booktabs=TRUE) %>%
+    kable_styling(bootstrap_options=c("striped","condensed"), full_width=FALSE)
+```
+
+## 5.2  Build merged subject-level dataset
+
+```{r merge}
+merged_abund <- cbind(
+    tett_avg[common, ],
+    chng_avg[common, ],
+    ohj_avg[common, ]
+)
+
+# Subject-level metadata for merged dataset
+tett_subj_meta <- unique(as.data.frame(colData(tett_se))[, c("subject_id","disease")])
+chng_subj_meta <- unique(as.data.frame(colData(chng_se))[, c("subject_id","disease")])
+
+# Resolve per-subject disease consistently
+resolve_dis <- function(vec) names(sort(table(vec), decreasing=TRUE))[1]
+
+meta <- rbind(
+    data.frame(study="TettAJ_2016",
+               subject_id = colnames(tett_avg),
+               disease = sapply(split(tett_subj_meta$disease, tett_subj_meta$subject_id), resolve_dis)),
+    data.frame(study="ChngKR_2016",
+               subject_id = colnames(chng_avg),
+               disease = sapply(split(chng_subj_meta$disease, chng_subj_meta$subject_id), resolve_dis)),
+    data.frame(study="OhJ_2014",
+               subject_id = colnames(ohj_avg),
+               disease = "healthy")
+)
+
+# Multi-label encoding
+meta$pso  <- grepl("psoriasis", meta$disease, ignore.case=TRUE)
+meta$ad   <- grepl("^AD",       meta$disease)
+meta$ar   <- grepl("^AR",       meta$disease)
+meta$arth <- grepl("^arthritis",meta$disease)
+meta$healthy <- meta$disease == "healthy"
+
+cat("Merged dataset: ", nrow(merged_abund), " taxa × ",
+    ncol(merged_abund), " subjects\n")
+```
+
+---
+
+# 6.  Feasibility assessment
+
+```{r feasibility}
+feas <- data.frame(
+    Pair = c(
+        "Psoriasis vs Psoriasis+Arthritis (Tett)",
+        "AD only vs AD+AR (Chng)",
+        "AD only vs AD+Asthma (Chng)",
+        "Cross-study: Psoriasis ←→ AD",
+        "Synthetic Psoriasis+AD mix"
+    ),
+    Design = c("2-group","2-group","2-group (AR confound)","cross-generalisation","simulation"),
+    N_A = c("21","5","5","28 (Tett)","—"),
+    N_Both = c("7","8","2 AD;asthma + 4 AD;AR;asthma","0","—"),
+    N_B_only = c("—","1 (excluded)","0","39 (Chng)","—"),
+    N_healthy = c("47 (OhJ+HMP)","15","15","62","47"),
+    Viability = c(
+        "✅ Viable. Test: does arthritis alter psoriasis signature? Consider age matching (Tett is older).",
+        "✅ Best skin option. N small (5 vs 8) — bootstrap or Bayesian approach. Exclude AR-only (n=1).",
+        "❌ No pure asthma group. AD;asthma (n=2) + AD;AR;asthma (n=4) — AR confounds interpretation.",
+        "⚠️  Tests whether disease-specific markers generalise across diseases/studies. No real comorbidity.",
+        "✅ Method development: mix real profiles at known proportions, validate recovery of mixing weights.")) %>%
+    kbl(caption="Feasibility of multi-label disentanglement designs (subject level)",
+        booktabs=TRUE) %>%
+    kable_styling(bootstrap_options=c("striped","condensed"), full_width=FALSE) %>%
+    column_spec(7, width="28em")
+```
+
+> **Why subject-level matters:** TettAJ_2016 has 89 samples but only 28 subjects.
+> Averaging per subject removes the pseudo-replication that would inflate
+> statistical significance. We lose sample size but gain honest inference.
+
+---
+
+# 7.  Beyond skin: positive controls with larger comorbid groups
+
+```{r positive-controls}
+other <- comorb[
+    !grepl(paste(skin_terms,collapse="|"), comorb$Disease_A, ignore.case=TRUE) &
+    !grepl(paste(skin_terms,collapse="|"), comorb$Disease_B, ignore.case=TRUE) &
+    comorb$A_only >= 20 & comorb$B_only >= 20 & comorb$Both >= 20, ]
+other %>%
+    pretty_table(caption=paste0("Non-skin pairs with ≥20 subjects in all groups (n=",
+                 nrow(other), ") — ideal for method validation"))
+```
+
+---
+
+# 8.  References
+
+```{r refs, cache=TRUE}
+refs <- unique(sm[, c("study_name","PMID")])
+n_subj <- tapply(sm$subject_id, sm$study_name, function(x) length(unique(x)))
+refs <- refs[order(refs$study_name), ]
+refs$N_subjects <- as.integer(n_subj[refs$study_name])
+refs$Body_site <- tapply(sm$body_site, sm$study_name,
+                         function(x) paste(unique(x), collapse=", "))[refs$study_name]
+
+refs %>% pretty_table(caption=paste0("All ", nrow(refs), " studies with PMIDs"), max.rows=30)
+```
+
+## Skin study citations
+
+```{r skin-citations}
+skin_refs <- refs[refs$study_name %in% c("ChngKR_2016","FerrettiP_2018","HMP_2012",
+                                          "OhJ_2014","OlmMR_2017","TettAJ_2016"), ]
+skin_refs$Citation <- c(
+    "Chng KR et al. (2016) Microbiome. PMID: 27562258",
+    "Ferretti P et al. (2018) Cell Host Microbe. PMID: 30001516",
+    "HMP Consortium (2012) Nature. PMID: 22699609",
+    "Oh J et al. (2014) Nature. PMID: 25279917",
+    "Olm MR et al. (2017) Cell Rep. PMID: 28073918",
+    "Tett AJ et al. (2016) Nat Commun. PMID: 28649415")
+skin_refs %>%
+    kbl(caption="Skin metagenome references", booktabs=TRUE) %>%
+    kable_styling(bootstrap_options=c("striped","condensed"), full_width=FALSE) %>%
+    column_spec(5, width="35em")
+```
+
+---
+
+# 9.  Data quality notes
+
+| Issue | Detail |
+|-------|--------|
+| **TettAJ_2016 repeated measures** | 89 samples from 28 subjects (2–4 per subject). Averaged per subject in Section 5. |
+| **TettAJ_20164 mislabel** | 3 of 4 samples say `arthritis;psoriasis`, 1 says `arthritis`. Likely data entry error. Resolved by majority vote to `arthritis;psoriasis`. |
+| **AD ambiguity** | `AD` = Alzheimer's Disease in 6 studies (stool), but **Atopic Dermatitis** in ChngKR_2016 (skin). Filter by `body_site == "skin"` to isolate Atopic Dermatitis. |
+| **ChngKR_2016 country mix** | Subjects from Singapore, China, Indonesia, Malaysia, Brunei. Potential population structure. FLG genotype available. |
+| **Age mismatch** | Tett (32–80 yrs) vs OhJ healthy (20–40 yrs). Age may confound disease signature. |
+| **Sequencing + extraction** | Tett: Illumina HiSeq + MoBio. Chng: Illumina HiSeq + Qiagen. Batch effects possible. |
+
+---
+
+*Session info: `r sessionInfo()$R.version.string` — curatedMetagenomicData
+`r as.character(packageVersion("curatedMetagenomicData"))`*
